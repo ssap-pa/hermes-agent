@@ -96,6 +96,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_CLI_BASE_URL = "claude-cli://print"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -231,6 +232,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "claude-cli": ProviderConfig(
+        id="claude-cli",
+        name="Claude CLI",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_CLI_BASE_URL,
+        base_url_env_var="CLAUDE_CLI_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1768,7 +1776,7 @@ def resolve_provider(
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
-        "claude": "anthropic", "claude-code": "anthropic",
+        "claude": "anthropic", "claude-code": "anthropic", "claude-cli": "claude-cli",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
@@ -6382,27 +6390,42 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "claude-cli":
+        command = (
+            os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CLI_PATH", "").strip()
+            or "claude"
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose"]
+        # claude-cli always spawns a local binary — unlike Copilot ACP there is
+        # no remote (acp+tcp://) transport that works without one, so the
+        # base URL never signals readiness on its own.
+        remote_prefix = None
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        remote_prefix = "acp+tcp://"
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
+    ready = bool(resolved_command or (remote_prefix and base_url.startswith(remote_prefix)))
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": ready,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "logged_in": ready,
     }
 
 
@@ -6423,7 +6446,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "claude-cli"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -6606,15 +6629,35 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "claude-cli":
+        command = (
+            os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CLI_PATH", "").strip()
+            or "claude"
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose"]
+        # See get_external_process_provider_status: claude-cli has no remote
+        # transport, so a resolvable local binary is the only readiness signal.
+        remote_prefix = None
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        remote_prefix = "acp+tcp://"
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    if not resolved_command and not (remote_prefix and base_url.startswith(remote_prefix)):
+        if provider_id == "claude-cli":
+            raise AuthError(
+                f"Could not find the Claude CLI command '{command}'. "
+                "Install Claude Code or set HERMES_CLAUDE_CLI_COMMAND/CLAUDE_CLI_PATH.",
+                provider=provider_id,
+                code="missing_claude_cli",
+            )
         raise AuthError(
             f"Could not find the Copilot CLI command '{command}'. "
             "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
@@ -6624,7 +6667,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": "claude-cli" if provider_id == "claude-cli" else "copilot-acp",
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
