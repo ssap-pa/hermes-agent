@@ -6397,7 +6397,11 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
             or "claude"
         )
         raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose"]
+        # --include-partial-messages: keep parity with ClaudeCLIClient._resolve_args
+        # so extended-thinking deltas stream on every resolved path (esp. auxiliary
+        # /compression), otherwise the 60s idle watchdog kills a legitimately-thinking
+        # large-context summary as a false stall.
+        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
         # claude-cli always spawns a local binary — unlike Copilot ACP there is
         # no remote (acp+tcp://) transport that works without one, so the
         # base URL never signals readiness on its own.
@@ -6636,7 +6640,10 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             or "claude"
         )
         raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose"]
+        # --include-partial-messages: parity with ClaudeCLIClient._resolve_args so
+        # extended-thinking deltas stream on the auxiliary/compression path too and
+        # the 60s idle watchdog does not false-kill a long large-context summary.
+        args = shlex.split(raw_args) if raw_args else ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
         # See get_external_process_provider_status: claude-cli has no remote
         # transport, so a resolvable local binary is the only readiness signal.
         remote_prefix = None
