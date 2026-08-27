@@ -356,3 +356,46 @@ change was performed by the Claude implementation subtask itself.
 ## Safety
 
 - No payment/auth-secret/env/DB/Cloudflare/main mutation. No credential values printed. Branch-isolated.
+
+---
+
+# Session 2026-08-27 (follow-up 2) — record-based child-task supervision
+
+## Requirement
+
+- Merge the Claude CLI stall fix.
+- Active child tasks must not be terminated by a wall-clock or idle duration.
+- Determine progress from lifecycle/process records instead.
+
+## Implementation
+
+- `agent/claude_cli_client.py`
+  - removed the 600s child-task idle ceiling and no-progress time-kill path;
+  - task lifecycle events (`task_started`, updates, terminal states) are the authority for the active exemption;
+  - `/proc` PID, CPU ticks, I/O bytes, and process-state changes are sampled and safely recorded as progress evidence;
+  - active task intervals are subtracted from the normal total-timeout clock, including after terminal events;
+  - stdout and stderr use one nonblocking selector (64KiB reads), eliminating reader-thread/qsize races;
+  - stream partial lines are capped at 1MiB, stderr memory at 64KiB;
+  - Claude runs in an isolated process group; actual parent exit or protocol failure cleans the group and prevents inherited-pipe orphans;
+  - ordinary calls with no active task retain the normal 60s idle/total timeout protection.
+- `tests/agent/test_claude_cli_stall_watchdog.py`
+  - deterministic coverage for lifecycle isolation, huge elapsed time exemption, paused total clock, PID/CPU/I/O/state snapshots, and flat-but-live waiting.
+
+## Verification
+
+- Syntax: `python3 -m py_compile` exit 0.
+- Focused regression suites: `210 passed in 7.56s`.
+- Real current-source Claude smokes: `PROGRESS_RECORDS_OK`, `SELECTOR_CLOCK_OK`, and final `DUAL_SELECTOR_OK`; all command exit codes 0.
+- Test review: `CODEX_REVIEW_claude_cli_progress_tests_r2.md` — High/Medium/Low/Nit 0, PASS.
+- Final strict source review: `CODEX_REVIEW_claude_cli_progress_records_r7.md` — High/Medium/Low/Nit 0, PASS.
+- Failed intermediate reviews (`*_final`, `r2`…`r6`) are retained locally as audit evidence but are not final verdict artifacts.
+
+## Routing evidence
+
+- Initial implementation draft was written by the live `claude-cli` Opus subprocesses (`claude -p --output-format stream-json --verbose --model claude-opus-4-8`), observed as gateway children before duplicate-process termination.
+- Review used `codex_review.sh` / Codex CLI `gpt-5.6-sol`; wrapper artifacts record exit codes and token counts.
+
+## Safety
+
+- No secrets, prompt text, thinking text, task IDs, payment/auth/DB/env/Cloudflare changes.
+- Work remains isolated on `fix/claude-cli-stall-rootfix-20260827` until PR merge.
