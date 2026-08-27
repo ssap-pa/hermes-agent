@@ -316,3 +316,43 @@ change was performed by the Claude implementation subtask itself.
 - No credential values were printed or committed.
 - No payment, auth, database, environment-secret, Cloudflare, or production-data mutation.
 - Work isolated on branch `fix/claude-cli-stall-rootfix-20260827`; unrelated pre-existing untracked files remain untouched.
+
+---
+
+# Session 2026-08-27 (follow-up) — compression-path stall: the *real* remaining root cause
+
+## Why the first fix was incomplete (evidence)
+
+- `~/.hermes/logs/agent.log` line 20177: this session hit `Preflight compression: ~138,030 tokens >= 64,000 threshold`.
+- line 20183: compression ran on `auxiliary auto (claude-opus-4-8) at claude-cli://print`.
+- line 20212 (03:38:03): `Failed to generate context summary: Claude CLI stalled: no meaningful stream event for 60s (hang detected, killed early)` — **after** the gateway had already restarted (03:36:52) onto the first fix's code.
+- `~/.hermes/logs/claude_cli_timeout.log` 03:38:03 entry: `[last stream event] {"type":"assistant"}` then 60s silence — a bare assistant-start with no thinking deltas.
+
+## Root cause (source-confirmed)
+
+- `agent/claude_cli_client.py:218` — `self._args = list(args or _resolve_args())`: passed-in `args` win over the default.
+- The first fix added `--include-partial-messages` only to `_resolve_args()`.
+- `hermes_cli/auth.py:6400` and `:6639` (both inside `if provider_id == "claude-cli":`) hardcoded the OLD list `["-p","--output-format","stream-json","--verbose"]` **without** the flag.
+- The auxiliary/compression client (`agent/auxiliary_client.py:5316`) is built with those resolved args → the flag never reached the compression path → extended-thinking deltas didn't stream → the 60s idle watchdog false-killed a legitimately-thinking 138k-token summary.
+
+## Change
+
+- `hermes_cli/auth.py` — add `--include-partial-messages` to both claude-cli default arg lists (copilot-acp path untouched; `HERMES_CLAUDE_CLI_ARGS` override still honored).
+- `tests/hermes_cli/test_claude_cli_provider.py` — `test_default_claude_cli_args_include_partial_messages` (hermetic via `monkeypatch` of `shutil.which` + `delenv`).
+
+## Verification
+
+- In-process: `resolve_provider_client('claude-cli', ...)` → `ClaudeCLIClient._args` now contains `--include-partial-messages` (compression path proven).
+- Both auth resolution paths assert the flag.
+- `python3 -m py_compile`: exit 0.
+- Tests: `tests/hermes_cli/test_claude_cli_provider.py` 5 passed; `test_claude_cli_stall_watchdog.py` 18 passed combined.
+- Codex: `CODEX_REVIEW_claude_cli_stall_auxargs.md` → Medium (non-hermetic test); fixed → `CODEX_REVIEW_claude_cli_stall_auxargs_r2.md` → High/Medium/Low/Nit 0, PASS.
+- Commits on `fix/claude-cli-stall-rootfix-20260827`: `91f35a620`, then hermetic test commit.
+
+## Activation note
+
+- The running gateway (MainPID from 03:36:52 restart) predates this auth.py commit, so it still resolves the OLD compression args. The fix is code-complete but takes effect only on the NEXT gateway restart. A restart briefly drops+auto-restores this chat (as just happened), so it is left for explicit go / next natural restart rather than self-interrupting.
+
+## Safety
+
+- No payment/auth-secret/env/DB/Cloudflare/main mutation. No credential values printed. Branch-isolated.
