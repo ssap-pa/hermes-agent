@@ -80,3 +80,25 @@ def test_aiagent_init_forwards_claude_cli_command_and_args():
     _, kwargs = mock_claude_client.call_args
     assert kwargs["command"] == "/opt/bin/claude"
     assert kwargs["args"] == ["-p", "--output-format", "stream-json"]
+
+
+def test_default_claude_cli_args_include_partial_messages(monkeypatch):
+    """Both auth resolution paths must default to --include-partial-messages so
+    the auxiliary/compression client streams extended-thinking deltas; without it
+    the 60s idle watchdog false-kills a legitimately-thinking large-context
+    summary (2026-08-27 compression stall root cause)."""
+    from hermes_cli.auth import (
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+
+    # Hermetic: pretend the claude binary resolves regardless of host install,
+    # and ensure the env override is not masking the hardcoded default.
+    monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: f"/usr/local/bin/{command}")
+    monkeypatch.delenv("HERMES_CLAUDE_CLI_ARGS", raising=False)
+
+    status = get_external_process_provider_status("claude-cli")
+    creds = resolve_external_process_provider_credentials("claude-cli")
+
+    assert "--include-partial-messages" in (status.get("args") or [])
+    assert "--include-partial-messages" in (creds.get("args") or [])

@@ -275,3 +275,127 @@ change was performed by the Claude implementation subtask itself.
 - Claude CLI primary smoke: session `20260810_092638_b5cfe4` returned `DRIVE_CLAUDE_CLI_OK` using `provider=claude-cli`, `model=claude-opus-4-8`, `base_url=claude-cli://print`; `agent.log` lines 42511-42515.
 - Fable control probe: session `20260810_092647_afc195` reached the same `claude-cli` transport but was rejected by Fable 5 safeguards after three attempts; `agent.log` lines 42541-42584.
 - Fresh Codex review: four one-file read-only requests; High 0. Medium/Low follow-ups are listed without concealment in `CODEX_REVIEW_claude_cli_provider.md`.
+
+---
+
+# Session 2026-08-27 — Claude CLI false-stall root fix
+
+## Root cause evidence
+
+- `~/.hermes/logs/claude_cli_timeout.log`: 2026-08-27 02:39 UTC had two `reason=idle limit=60s` terminations whose last event was an assistant `thinking` block with empty visible text.
+- `~/.hermes/logs/agent.log`: compression first called explicit `openai-codex`, waited 300s for a failed/incomplete stream, then fell back to the main Claude CLI path.
+- The fallback Claude process remained alive after fallback and concurrently edited the same file; PID 2573666 was terminated after its read-only Codex child completed and its changes were preserved.
+
+## Changes
+
+- `agent/claude_cli_client.py`
+  - default Claude CLI args now include `--include-partial-messages` so thinking deltas reset the idle timer;
+  - tracks `task_started` through all observed terminal lifecycle events;
+  - active child tasks use a separate idle window hard-clamped to 600 seconds, never the full request timeout;
+  - timeout/performance logs retain event metadata only, never partial thinking/text/command arguments;
+  - invalid, NaN, infinite, negative, and oversized tool-idle overrides are bounded safely.
+- `tests/agent/test_claude_cli_stall_watchdog.py`
+  - deterministic, no-sleep/no-network regression coverage for partial streaming, bounded idle, terminal lifecycle, and redaction.
+- Live config via official CLI:
+  - `auxiliary.compression.provider: openai-codex -> auto`
+  - `auxiliary.compression.model: gpt-5.5 -> ''`
+  - runtime resolution probe returned `ClaudeCLIClient claude-opus-4-8 claude-cli://print`.
+  - backup: `~/.hermes/config.yaml.bak.claude-stall-20260827T031311Z`.
+
+## Verification
+
+- RED before final lifecycle/bound fix: `1 passed, 3 failed`.
+- GREEN: `200 passed in 7.75s` across stall watchdog, Claude provider, and context compressor suites.
+- `python3 -m py_compile`: exit 0.
+- `hermes config check`: config version 33 valid.
+- Final strict Codex source review: `CODEX_REVIEW_claude_cli_stall_rootfix_r4.md` — High 0 / Medium 0 / Low 0 / PASS.
+- Deterministic test review: `CODEX_REVIEW_claude_cli_stall_tests_r2.md` — High 0 / PASS; one Low NaN case was subsequently fixed and covered with NaN/Inf assertions.
+
+## Safety
+
+- No credential values were printed or committed.
+- No payment, auth, database, environment-secret, Cloudflare, or production-data mutation.
+- Work isolated on branch `fix/claude-cli-stall-rootfix-20260827`; unrelated pre-existing untracked files remain untouched.
+
+---
+
+# Session 2026-08-27 (follow-up) — compression-path stall: the *real* remaining root cause
+
+## Why the first fix was incomplete (evidence)
+
+- `~/.hermes/logs/agent.log` line 20177: this session hit `Preflight compression: ~138,030 tokens >= 64,000 threshold`.
+- line 20183: compression ran on `auxiliary auto (claude-opus-4-8) at claude-cli://print`.
+- line 20212 (03:38:03): `Failed to generate context summary: Claude CLI stalled: no meaningful stream event for 60s (hang detected, killed early)` — **after** the gateway had already restarted (03:36:52) onto the first fix's code.
+- `~/.hermes/logs/claude_cli_timeout.log` 03:38:03 entry: `[last stream event] {"type":"assistant"}` then 60s silence — a bare assistant-start with no thinking deltas.
+
+## Root cause (source-confirmed)
+
+- `agent/claude_cli_client.py:218` — `self._args = list(args or _resolve_args())`: passed-in `args` win over the default.
+- The first fix added `--include-partial-messages` only to `_resolve_args()`.
+- `hermes_cli/auth.py:6400` and `:6639` (both inside `if provider_id == "claude-cli":`) hardcoded the OLD list `["-p","--output-format","stream-json","--verbose"]` **without** the flag.
+- The auxiliary/compression client (`agent/auxiliary_client.py:5316`) is built with those resolved args → the flag never reached the compression path → extended-thinking deltas didn't stream → the 60s idle watchdog false-killed a legitimately-thinking 138k-token summary.
+
+## Change
+
+- `hermes_cli/auth.py` — add `--include-partial-messages` to both claude-cli default arg lists (copilot-acp path untouched; `HERMES_CLAUDE_CLI_ARGS` override still honored).
+- `tests/hermes_cli/test_claude_cli_provider.py` — `test_default_claude_cli_args_include_partial_messages` (hermetic via `monkeypatch` of `shutil.which` + `delenv`).
+
+## Verification
+
+- In-process: `resolve_provider_client('claude-cli', ...)` → `ClaudeCLIClient._args` now contains `--include-partial-messages` (compression path proven).
+- Both auth resolution paths assert the flag.
+- `python3 -m py_compile`: exit 0.
+- Tests: `tests/hermes_cli/test_claude_cli_provider.py` 5 passed; `test_claude_cli_stall_watchdog.py` 18 passed combined.
+- Codex: `CODEX_REVIEW_claude_cli_stall_auxargs.md` → Medium (non-hermetic test); fixed → `CODEX_REVIEW_claude_cli_stall_auxargs_r2.md` → High/Medium/Low/Nit 0, PASS.
+- Commits on `fix/claude-cli-stall-rootfix-20260827`: `91f35a620`, then hermetic test commit.
+
+## Activation note
+
+- The running gateway (MainPID from 03:36:52 restart) predates this auth.py commit, so it still resolves the OLD compression args. The fix is code-complete but takes effect only on the NEXT gateway restart. A restart briefly drops+auto-restores this chat (as just happened), so it is left for explicit go / next natural restart rather than self-interrupting.
+
+## Safety
+
+- No payment/auth-secret/env/DB/Cloudflare/main mutation. No credential values printed. Branch-isolated.
+
+---
+
+# Session 2026-08-27 (follow-up 2) — record-based child-task supervision
+
+## Requirement
+
+- Merge the Claude CLI stall fix.
+- Active child tasks must not be terminated by a wall-clock or idle duration.
+- Determine progress from lifecycle/process records instead.
+
+## Implementation
+
+- `agent/claude_cli_client.py`
+  - removed the 600s child-task idle ceiling and no-progress time-kill path;
+  - task lifecycle events (`task_started`, updates, terminal states) are the authority for the active exemption;
+  - `/proc` PID, CPU ticks, I/O bytes, and process-state changes are sampled and safely recorded as progress evidence;
+  - active task intervals are subtracted from the normal total-timeout clock, including after terminal events;
+  - stdout and stderr use one nonblocking selector (64KiB reads), eliminating reader-thread/qsize races;
+  - stream partial lines are capped at 1MiB, stderr memory at 64KiB;
+  - Claude runs in an isolated process group; actual parent exit or protocol failure cleans the group and prevents inherited-pipe orphans;
+  - ordinary calls with no active task retain the normal 60s idle/total timeout protection.
+- `tests/agent/test_claude_cli_stall_watchdog.py`
+  - deterministic coverage for lifecycle isolation, huge elapsed time exemption, paused total clock, PID/CPU/I/O/state snapshots, and flat-but-live waiting.
+
+## Verification
+
+- Syntax: `python3 -m py_compile` exit 0.
+- Focused regression suites: `210 passed in 7.56s`.
+- Real current-source Claude smokes: `PROGRESS_RECORDS_OK`, `SELECTOR_CLOCK_OK`, and final `DUAL_SELECTOR_OK`; all command exit codes 0.
+- Test review: `CODEX_REVIEW_claude_cli_progress_tests_r2.md` — High/Medium/Low/Nit 0, PASS.
+- Final strict source review: `CODEX_REVIEW_claude_cli_progress_records_r7.md` — High/Medium/Low/Nit 0, PASS.
+- Failed intermediate reviews (`*_final`, `r2`…`r6`) are retained locally as audit evidence but are not final verdict artifacts.
+
+## Routing evidence
+
+- Initial implementation draft was written by the live `claude-cli` Opus subprocesses (`claude -p --output-format stream-json --verbose --model claude-opus-4-8`), observed as gateway children before duplicate-process termination.
+- Review used `codex_review.sh` / Codex CLI `gpt-5.6-sol`; wrapper artifacts record exit codes and token counts.
+
+## Safety
+
+- No secrets, prompt text, thinking text, task IDs, payment/auth/DB/env/Cloudflare changes.
+- Work remains isolated on `fix/claude-cli-stall-rootfix-20260827` until PR merge.
