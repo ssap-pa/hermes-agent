@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import shlex
@@ -29,9 +30,74 @@ _DEFAULT_TIMEOUT_SECONDS = 900.0
 # claude가 내부 툴로 여러 턴을 돌아도 턴마다 이벤트가 나오므로 정상 작업은 절대 안 걸린다.
 # 이게 "논스트리밍 블라인드 30분 대기"의 근본 대체물이다.
 _IDLE_EVENT_TIMEOUT_SECONDS = float(os.getenv("HERMES_CLAUDE_CLI_IDLE_TIMEOUT", "60"))
+# 자식작업(빌드·Codex리뷰 등)이 도는 동안은 부모 스트림이 수 분간 조용한 게 정상이라 유휴감시를
+# 이 값까지 완화한다. 단 전체 타임아웃(최대 1800s)까지 무제한 면제하면 task 종료 이벤트를 놓쳐
+# id가 새는 경우 작업 후 진짜 hang을 30분간 못 잡으므로, 바운드된 backstop(기본 600s, env조정)으로
+# 상한을 둔다. 진짜 hang은 이 상한 안에 잡히고, 정상 자식작업은 이 안에서 종료 이벤트를 낸다.
+_MAX_TOOL_IDLE_EVENT_TIMEOUT_SECONDS = 600.0
+
+
+def _bounded_tool_idle_timeout(raw: str) -> float:
+    """Return a positive tool-idle window with an unbypassable 600s ceiling."""
+    try:
+        requested = float(raw)
+    except (TypeError, ValueError):
+        requested = _MAX_TOOL_IDLE_EVENT_TIMEOUT_SECONDS
+    if not math.isfinite(requested):
+        requested = _MAX_TOOL_IDLE_EVENT_TIMEOUT_SECONDS
+    return min(max(requested, _IDLE_EVENT_TIMEOUT_SECONDS),
+               _MAX_TOOL_IDLE_EVENT_TIMEOUT_SECONDS)
+
+
+_TOOL_IDLE_EVENT_TIMEOUT_SECONDS = _bounded_tool_idle_timeout(
+    os.getenv("HERMES_CLAUDE_CLI_TOOL_IDLE_TIMEOUT", "600")
+)
 _RATE_LIMIT_STATE_PATH = os.path.expanduser("~/.hermes/state/claude_rate_limit.json")
 _TIMEOUT_LOG_PATH = os.path.expanduser("~/.hermes/logs/claude_cli_timeout.log")
 _PERF_LOG_PATH = os.path.expanduser("~/.hermes/logs/claude_cli_perf.jsonl")
+
+
+def _redact_event(line: str) -> str:
+    """스트림 라인에서 진단에 필요한 구조(type/subtype/task_id)만 남기고 본문(사고·텍스트·툴
+    델타 등 잠재적 민감내용)은 로그에 남기지 않는다. 파싱 실패 시 길이만 남긴다."""
+    try:
+        e = json.loads(line)
+        keys = {k: e.get(k) for k in ("type", "subtype", "task_id") if e.get(k) is not None}
+        return json.dumps(keys, ensure_ascii=False) if keys else f"<{len(line)}B>"
+    except Exception:
+        return f"<{len(line)}B non-json>"
+
+
+def _update_active_tasks(active_tasks: set, event: dict) -> None:
+    """Apply one Claude system task lifecycle event to ``active_tasks``."""
+    if event.get("type") != "system":
+        return
+    subtype = event.get("subtype")
+    task_id = event.get("task_id")
+    if not task_id:
+        return
+    if subtype == "task_started":
+        active_tasks.add(task_id)
+        return
+    if subtype in {
+        "task_completed", "task_failed", "task_cancelled", "task_notification",
+    }:
+        active_tasks.discard(task_id)
+        return
+    if subtype == "task_updated":
+        patch = event.get("patch") or {}
+        status = patch.get("status") if isinstance(patch, dict) else None
+        status = status or event.get("status")
+        if status in {"completed", "failed", "cancelled", "killed"}:
+            active_tasks.discard(task_id)
+
+
+def _effective_idle_timeout(active_tasks: set, normal_idle: float,
+                            total_timeout: float) -> float:
+    """Use the bounded tool window only while a child task is actually active."""
+    if not active_tasks:
+        return normal_idle
+    return min(_TOOL_IDLE_EVENT_TIMEOUT_SECONDS, total_timeout)
 
 
 def _perf_log(payload: dict) -> None:
@@ -70,7 +136,11 @@ def _resolve_args() -> list[str]:
     #    이걸 파싱해 한도 상태를 실제 데이터로 기록한다(실측 이중확인).
     #  - --tools "" 는 되돌렸다(=claude 내부 툴 원래 기본값대로 활성화). 툴 차단은 hang의
     #    근본치료가 아니었고, 진짜 해법은 위 스트리밍 조기감지다.
-    return ["-p", "--output-format", "stream-json", "--verbose"]
+    #  - --include-partial-messages: 확장추론(extended thinking) 중 stream-json이 메시지
+    #    단위라 60초+ 침묵 → 유휴감시 오발화(건강한 프로세스 kill)의 근본원인이었다. 부분
+    #    청크(thinking_delta 등)를 실시간으로 뱉게 해 생각 중에도 이벤트가 흘러 유휴타이머가
+    #    리셋된다 → 스톨 오판 제거. (claude --help 로 플래그 실재 확인)
+    return ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
 
 
 def _timeout_to_seconds(timeout: Any) -> float:
@@ -199,7 +269,8 @@ class ClaudeCLIClient:
             "model": model,
             "prompt_chars": len(prompt_text or ""),
             "timeout_seconds": timeout_seconds,
-            "cmd": [os.path.basename(x) if i == 0 else x for i, x in enumerate(cmd)],
+            "cmd0": os.path.basename(cmd[0]) if cmd else "",
+            "argc": len(cmd),
         })
         try:
             proc = subprocess.Popen(
@@ -249,6 +320,7 @@ class ClaudeCLIClient:
         last_event_text = ""
         first_event_seen = False
         event_count = 0
+        active_tasks: set = set()  # 실행 중인 자식작업(빌드·Codex리뷰 등) id — 유휴감시 예외용
         start = time.time()
         last_meaningful_event_at = start
         idle = min(_IDLE_EVENT_TIMEOUT_SECONDS, timeout_seconds)
@@ -259,39 +331,45 @@ class ClaudeCLIClient:
                 raise RuntimeError(
                     f"Claude CLI exceeded total timeout {timeout_seconds:.0f}s (killed)"
                 )
+            # 자식작업(빌드·Codex리뷰 등)이 실행 중이면 부모 스트림이 수 분간 조용한 게 정상.
+            # 단, 별도 tool 상한까지만 완화해 task 종료 이벤트 누락/자식 hang도 유한 시간에 잡는다.
+            effective_idle = _effective_idle_timeout(
+                active_tasks, idle, timeout_seconds
+            )
             try:
                 line = line_q.get(timeout=min(5.0, idle))
             except queue.Empty:
-                if time.time() - last_meaningful_event_at <= idle:
+                if time.time() - last_meaningful_event_at <= effective_idle:
                     continue
-                # 유휴 타임아웃: idle초 동안 의미 있는 이벤트가 하나도 안 옴 = 진짜 먹통(hang) → 즉시 kill.
-                _perf_log({"event": "idle_timeout", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "idle_sec": idle, "event_count": event_count, "last_event": last_event_text[:200]})
-                self._kill_and_log(proc, model, idle, last_event_text, reason="idle")
+                # 유휴 타임아웃: effective_idle초 동안 이벤트가 하나도 안 옴 = 진짜 먹통(hang) → kill.
+                _perf_log({"event": "idle_timeout", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "idle_sec": effective_idle, "active_tasks": len(active_tasks), "event_count": event_count, "last_event": last_event_text[:200]})
+                self._kill_and_log(proc, model, effective_idle, last_event_text, reason="idle")
                 raise RuntimeError(
-                    f"Claude CLI stalled: no meaningful stream event for {idle:.0f}s (hang detected, killed early)"
+                    f"Claude CLI stalled: no meaningful stream event for {effective_idle:.0f}s (hang detected, killed early)"
                 )
             if line is None:
                 break  # EOF
             line = line.strip()
             if not line:
-                if time.time() - last_meaningful_event_at > idle:
-                    _perf_log({"event": "idle_timeout", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "idle_sec": idle, "event_count": event_count, "last_event": last_event_text[:200], "blank_keepalive": True})
-                    self._kill_and_log(proc, model, idle, last_event_text, reason="idle_blank_keepalive")
+                if time.time() - last_meaningful_event_at > effective_idle:
+                    _perf_log({"event": "idle_timeout", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "idle_sec": effective_idle, "active_tasks": len(active_tasks), "event_count": event_count, "last_event": last_event_text[:200], "blank_keepalive": True})
+                    self._kill_and_log(proc, model, effective_idle, last_event_text, reason="idle_blank_keepalive")
                     raise RuntimeError(
-                        f"Claude CLI stalled: no meaningful stream event for {idle:.0f}s (blank keepalives ignored, killed early)"
+                        f"Claude CLI stalled: no meaningful stream event for {effective_idle:.0f}s (blank keepalives ignored, killed early)"
                     )
                 continue
             last_meaningful_event_at = time.time()
-            last_event_text = line[:500]
+            last_event_text = _redact_event(line)
             event_count += 1
             if not first_event_seen:
                 first_event_seen = True
-                _perf_log({"event": "first_stream_event", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "line_prefix": line[:120]})
+                _perf_log({"event": "first_stream_event", "call_id": call_id, "elapsed_sec": round(time.time() - t0, 3), "line_prefix": _redact_event(line)})
             try:
                 evt = json.loads(line)
             except Exception:
                 continue
             etype = evt.get("type")
+            _update_active_tasks(active_tasks, evt)
             if etype == "rate_limit_event":
                 info = evt.get("rate_limit_info")
                 if isinstance(info, dict):

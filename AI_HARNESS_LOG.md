@@ -275,3 +275,44 @@ change was performed by the Claude implementation subtask itself.
 - Claude CLI primary smoke: session `20260810_092638_b5cfe4` returned `DRIVE_CLAUDE_CLI_OK` using `provider=claude-cli`, `model=claude-opus-4-8`, `base_url=claude-cli://print`; `agent.log` lines 42511-42515.
 - Fable control probe: session `20260810_092647_afc195` reached the same `claude-cli` transport but was rejected by Fable 5 safeguards after three attempts; `agent.log` lines 42541-42584.
 - Fresh Codex review: four one-file read-only requests; High 0. Medium/Low follow-ups are listed without concealment in `CODEX_REVIEW_claude_cli_provider.md`.
+
+---
+
+# Session 2026-08-27 — Claude CLI false-stall root fix
+
+## Root cause evidence
+
+- `~/.hermes/logs/claude_cli_timeout.log`: 2026-08-27 02:39 UTC had two `reason=idle limit=60s` terminations whose last event was an assistant `thinking` block with empty visible text.
+- `~/.hermes/logs/agent.log`: compression first called explicit `openai-codex`, waited 300s for a failed/incomplete stream, then fell back to the main Claude CLI path.
+- The fallback Claude process remained alive after fallback and concurrently edited the same file; PID 2573666 was terminated after its read-only Codex child completed and its changes were preserved.
+
+## Changes
+
+- `agent/claude_cli_client.py`
+  - default Claude CLI args now include `--include-partial-messages` so thinking deltas reset the idle timer;
+  - tracks `task_started` through all observed terminal lifecycle events;
+  - active child tasks use a separate idle window hard-clamped to 600 seconds, never the full request timeout;
+  - timeout/performance logs retain event metadata only, never partial thinking/text/command arguments;
+  - invalid, NaN, infinite, negative, and oversized tool-idle overrides are bounded safely.
+- `tests/agent/test_claude_cli_stall_watchdog.py`
+  - deterministic, no-sleep/no-network regression coverage for partial streaming, bounded idle, terminal lifecycle, and redaction.
+- Live config via official CLI:
+  - `auxiliary.compression.provider: openai-codex -> auto`
+  - `auxiliary.compression.model: gpt-5.5 -> ''`
+  - runtime resolution probe returned `ClaudeCLIClient claude-opus-4-8 claude-cli://print`.
+  - backup: `~/.hermes/config.yaml.bak.claude-stall-20260827T031311Z`.
+
+## Verification
+
+- RED before final lifecycle/bound fix: `1 passed, 3 failed`.
+- GREEN: `200 passed in 7.75s` across stall watchdog, Claude provider, and context compressor suites.
+- `python3 -m py_compile`: exit 0.
+- `hermes config check`: config version 33 valid.
+- Final strict Codex source review: `CODEX_REVIEW_claude_cli_stall_rootfix_r4.md` — High 0 / Medium 0 / Low 0 / PASS.
+- Deterministic test review: `CODEX_REVIEW_claude_cli_stall_tests_r2.md` — High 0 / PASS; one Low NaN case was subsequently fixed and covered with NaN/Inf assertions.
+
+## Safety
+
+- No credential values were printed or committed.
+- No payment, auth, database, environment-secret, Cloudflare, or production-data mutation.
+- Work isolated on branch `fix/claude-cli-stall-rootfix-20260827`; unrelated pre-existing untracked files remain untouched.
